@@ -83,6 +83,7 @@ class STTService(AIService):
         audio_passthrough=True,
         sample_rate: Optional[int] = None,
         stt_ttfb_timeout: float = 2.0,
+        finalize_timeout: Optional[float] = None,
         ttfs_p99_latency: Optional[float] = None,
         keepalive_timeout: Optional[float] = None,
         keepalive_interval: float = 5.0,
@@ -102,6 +103,11 @@ class STTService(AIService):
                 request to first response byte). Since STT receives continuous audio, we measure
                 from when the user stops speaking to when the final transcript arrives—capturing
                 the latency that matters for voice AI applications.
+            finalize_timeout: Seconds to wait for a finalized transcript after
+                ``request_finalize()`` is called.  If the provider does not confirm
+                within this window, stale metrics are stopped and an
+                ``on_finalize_timeout`` event is emitted so subclasses can reconnect.
+                ``None`` disables the timeout (default).
             ttfs_p99_latency: P99 latency from speech end to final transcript in seconds.
                 This is broadcast via STTMetadataFrame at pipeline start for downstream
                 processors (e.g., turn strategies) to optimize timing. Subclasses provide
@@ -155,6 +161,7 @@ class STTService(AIService):
         self._user_speaking: bool = False
         self._finalize_pending: bool = False
         self._finalize_requested: bool = False
+        self._finalize_timeout_seconds = finalize_timeout
         self._last_transcript_time: float = 0
 
         # Keepalive state
@@ -166,6 +173,7 @@ class STTService(AIService):
         self._register_event_handler("on_connected")
         self._register_event_handler("on_disconnected")
         self._register_event_handler("on_connection_error")
+        self._register_event_handler("on_finalize_timeout")
 
     @property
     def is_muted(self) -> bool:
