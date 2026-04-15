@@ -162,6 +162,7 @@ class STTService(AIService):
         self._finalize_pending: bool = False
         self._finalize_requested: bool = False
         self._finalize_timeout_seconds = finalize_timeout
+        self._finalize_timeout_task: Optional[asyncio.Task] = None
         self._last_transcript_time: float = 0
 
         # Keepalive state
@@ -193,8 +194,13 @@ class STTService(AIService):
 
         For providers without server confirmation, don't call this method - just
         send the finalize/flush/commit command and rely on the TTFB timeout.
+
+        If ``finalize_timeout`` was set, starts a safety timer. When the timer
+        fires without ``confirm_finalize()`` being called, stale metrics are
+        stopped and the ``on_finalize_timeout`` event is emitted.
         """
         self._finalize_requested = True
+        self._start_finalize_timeout()
 
     def confirm_finalize(self):
         """Confirm that the server has acknowledged the finalize request.
@@ -208,6 +214,7 @@ class STTService(AIService):
         if self._finalize_requested:
             self._finalize_pending = True
             self._finalize_requested = False
+            self._cancel_finalize_timeout_sync()
 
     @property
     def sample_rate(self) -> int:
@@ -297,6 +304,7 @@ class STTService(AIService):
         """Clean up STT service resources."""
         await super().cleanup()
         await self._cancel_ttfb_timeout()
+        await self._cancel_finalize_timeout()
         await self._cancel_keepalive_task()
 
     async def _update_settings(self, delta: STTSettings) -> dict[str, Any]:
@@ -448,8 +456,9 @@ class STTService(AIService):
             # If this is a finalized transcription, report TTFB immediately
             if frame.finalized:
                 await self.stop_ttfb_metrics()
-                # Cancel the timeout since we've already reported
+                # Cancel timeouts since we've already received the final transcript
                 await self._cancel_ttfb_timeout()
+                await self._cancel_finalize_timeout()
 
         await super().push_frame(frame, direction)
 
@@ -467,6 +476,62 @@ class STTService(AIService):
             await self.cancel_task(self._ttfb_timeout_task)
             self._ttfb_timeout_task = None
 
+    def _start_finalize_timeout(self):
+        """Start the finalize safety timer if configured.
+
+        Called automatically by ``request_finalize()``. If a finalize timeout
+        is set and no previous timeout is running, creates a task that will
+        fire ``_finalize_timeout_handler`` after the configured delay.
+        """
+        if self._finalize_timeout_seconds is None:
+            return
+        if self._finalize_timeout_task is not None:
+            return
+        self._finalize_timeout_task = self.create_task(
+            self._finalize_timeout_handler(), name="stt_finalize_timeout"
+        )
+
+    def _cancel_finalize_timeout_sync(self):
+        """Schedule cancellation of the finalize timeout task.
+
+        Safe to call from synchronous methods (``confirm_finalize``). The
+        actual ``await cancel_task()`` runs in a fire-and-forget task.
+        """
+        task = self._finalize_timeout_task
+        if task is not None:
+            self._finalize_timeout_task = None
+            task.cancel()
+
+    async def _cancel_finalize_timeout(self):
+        """Cancel the finalize timeout task (async version)."""
+        if self._finalize_timeout_task:
+            await self.cancel_task(self._finalize_timeout_task)
+            self._finalize_timeout_task = None
+
+    async def _finalize_timeout_handler(self):
+        """Fire when no finalized transcript arrives after ``request_finalize()``.
+
+        Resets stale finalize state, stops dangling metrics, and emits the
+        ``on_finalize_timeout`` event so subclasses can reconnect.
+        """
+        try:
+            await asyncio.sleep(self._finalize_timeout_seconds)
+            if not self._finalize_requested:
+                # confirm_finalize() was called in the meantime — nothing to do
+                return
+            logger.warning(
+                f"{self}: No finalized transcript received within "
+                f"{self._finalize_timeout_seconds}s after finalize request"
+            )
+            self._finalize_requested = False
+            self._finalize_pending = False
+            await self.stop_all_metrics()
+            await self._call_event_handler("on_finalize_timeout")
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._finalize_timeout_task = None
+
     async def _reset_stt_ttfb_state(self):
         """Reset STT TTFB measurement state.
 
@@ -479,6 +544,7 @@ class STTService(AIService):
         while user is still speaking.
         """
         await self._cancel_ttfb_timeout()
+        await self._cancel_finalize_timeout()
 
     async def _handle_vad_user_started_speaking(self, frame: VADUserStartedSpeakingFrame):
         """Handle VAD user started speaking frame to start tracking transcriptions.
