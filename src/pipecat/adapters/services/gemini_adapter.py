@@ -327,6 +327,9 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
         # Remove any empty messages
         messages = [m for m in messages if m.parts]
 
+        # Gemini rejects consecutive contents with the same role.
+        messages = self._merge_consecutive_same_role_messages(messages)
+
         return self.ConvertedMessages(
             messages=messages,
             system_instruction=extracted_system,
@@ -474,6 +477,37 @@ class GeminiLLMAdapter(BaseLLMAdapter[GeminiLLMInvocationParams]):
             content=Content(role=role, parts=parts),
             tool_call_id_to_name_mapping=tool_call_id_to_name_mapping,
         )
+
+    def _merge_consecutive_same_role_messages(self, messages: list[Content]) -> list[Content]:
+        """Merge consecutive messages sharing a role into single Content objects.
+
+        Gemini requires role alternation and rejects requests where two
+        consecutive contents have the same role, which happens when the context
+        stores a model turn's text and function calls as separate messages
+        (https://github.com/pipecat-ai/pipecat/issues/3290). Merging is
+        order-preserving: parts are concatenated in message order. Runs after
+        _merge_parallel_tool_calls_for_thinking, whose grouped output already
+        alternates, so it only affects sequences that merge left unmerged.
+
+        Args:
+            messages: List of Content messages to process.
+
+        Returns:
+            List of Content messages with consecutive same-role messages merged.
+        """
+        if not messages:
+            return messages
+
+        merged = [messages[0]]
+        for msg in messages[1:]:
+            if msg.role == merged[-1].role:
+                merged[-1] = Content(
+                    role=msg.role,
+                    parts=list(merged[-1].parts or []) + list(msg.parts or []),
+                )
+            else:
+                merged.append(msg)
+        return merged
 
     def _merge_parallel_tool_calls_for_thinking(
         self, thought_signature_dicts: list[dict], messages: list[Content]
