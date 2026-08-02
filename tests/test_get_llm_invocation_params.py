@@ -547,7 +547,7 @@ class TestGeminiGetLLMInvocationParams(unittest.TestCase):
         user_with_audio = None
 
         for msg in params["messages"]:
-            if msg.role == "user" and len(msg.parts) == 2:
+            if msg.role == "user" and len(msg.parts) >= 2:
                 # Check if it's image or audio based on the text content
                 if hasattr(msg.parts[0], "text") and "image" in msg.parts[0].text:
                     user_with_image = msg
@@ -567,9 +567,10 @@ class TestGeminiGetLLMInvocationParams(unittest.TestCase):
         self.assertIsNotNone(user_with_image.parts[1].inline_data)
         self.assertEqual(user_with_image.parts[1].inline_data.mime_type, "image/jpeg")
 
-        # Verify the audio message structure is converted properly
+        # Verify the audio message structure is converted properly. Since no
+        # message here is a single text part, the system instruction is added
+        # back as a user message and merged into this final user turn.
         self.assertIsNotNone(user_with_audio, "Should have user message with audio")
-        self.assertEqual(len(user_with_audio.parts), 2)
 
         # First part should be text
         self.assertEqual(user_with_audio.parts[0].text, "Can you transcribe this audio?")
@@ -629,31 +630,17 @@ class TestGeminiGetLLMInvocationParams(unittest.TestCase):
         # First system instruction should be extracted
         self.assertEqual(params["system_instruction"], "You are a helpful assistant.")
 
-        # Should have 6 messages (original 7 minus 1 system instruction that was extracted)
-        self.assertEqual(len(params["messages"]), 6)
+        # The converted system messages become user role and merge with the
+        # adjacent user messages, so the conversation alternates cleanly.
+        self.assertEqual(len(params["messages"]), 4)
+        self.assertEqual([m.role for m in params["messages"]], ["user", "model", "user", "model"])
 
-        # Find the converted system messages (should be user role now)
-        converted_system_messages = []
-        for msg in params["messages"]:
-            if msg.role == "user" and (
-                msg.parts[0].text == "Remember to be concise."
-                or msg.parts[0].text == "Use simple language."
-            ):
-                converted_system_messages.append(msg.parts[0].text)
-
-        # Should have 2 converted system messages
-        self.assertEqual(len(converted_system_messages), 2)
-        self.assertIn("Remember to be concise.", converted_system_messages)
-        self.assertIn("Use simple language.", converted_system_messages)
-
-        # Verify that regular user and assistant messages are preserved
-        user_messages = [msg for msg in params["messages"] if msg.role == "user"]
-        model_messages = [msg for msg in params["messages"] if msg.role == "model"]
-
-        # Should have 4 user messages: 2 original + 2 converted from system
-        self.assertEqual(len(user_messages), 4)
-        # Should have 2 model messages (converted from assistant)
-        self.assertEqual(len(model_messages), 2)
+        # The converted system texts survive as parts of the merged user turn
+        merged_user_texts = [p.text for p in params["messages"][2].parts]
+        self.assertEqual(
+            merged_user_texts,
+            ["Remember to be concise.", "Tell me about Python.", "Use simple language."],
+        )
 
     def test_system_instruction_only(self):
         """system_instruction alone becomes the system_instruction parameter."""
@@ -687,9 +674,10 @@ class TestGeminiGetLLMInvocationParams(unittest.TestCase):
         params = self.adapter.get_llm_invocation_params(context)
 
         self.assertIsNone(params["system_instruction"])
-        self.assertEqual(len(params["messages"]), 2)
+        # The converted developer message merges with the adjacent user message
+        self.assertEqual(len(params["messages"]), 1)
         self.assertEqual(params["messages"][0].role, "user")
-        self.assertEqual(params["messages"][0].parts[0].text, "Extra context.")
+        self.assertEqual([p.text for p in params["messages"][0].parts], ["Extra context.", "Hello"])
 
     def test_both_system_instruction_and_system_message_warns(self):
         """system_instruction + initial system message warns and uses system_instruction."""
@@ -735,9 +723,14 @@ class TestGeminiGetLLMInvocationParams(unittest.TestCase):
 
         # No system instruction should be extracted from non-initial position
         self.assertIsNone(params["system_instruction"])
-        # The system message should have been converted to user role in the Gemini Content
-        # (we check that 3 messages are present, meaning no extraction happened)
-        self.assertEqual(len(params["messages"]), 3)
+        # The system message is converted to user role and merged with the
+        # neighboring user messages into a single user turn
+        self.assertEqual(len(params["messages"]), 1)
+        self.assertEqual(params["messages"][0].role, "user")
+        self.assertEqual(
+            [p.text for p in params["messages"][0].parts],
+            ["Hello", "Late system message", "How are you?"],
+        )
 
     def test_subsequent_developer_messages_converted_to_user(self):
         """Subsequent developer messages are converted to user role."""
@@ -748,9 +741,12 @@ class TestGeminiGetLLMInvocationParams(unittest.TestCase):
         context = LLMContext(messages=messages)
         params = self.adapter.get_llm_invocation_params(context)
 
-        self.assertEqual(len(params["messages"]), 2)
-        # Second message (developer) should be converted to user in Google format
-        self.assertEqual(params["messages"][1].role, "user")
+        # The converted developer message merges with the preceding user message
+        self.assertEqual(len(params["messages"]), 1)
+        self.assertEqual(params["messages"][0].role, "user")
+        self.assertEqual(
+            [p.text for p in params["messages"][0].parts], ["Hello", "More instructions"]
+        )
 
     # --- _merge_parallel_tool_calls_for_thinking ---
     #
@@ -915,6 +911,112 @@ class TestGeminiGetLLMInvocationParams(unittest.TestCase):
     def test_merge_empty_messages(self):
         """An empty message list returns empty."""
         self.assertEqual(self.adapter._merge_parallel_tool_calls_for_thinking([], []), [])
+
+    # --- _merge_consecutive_same_role_messages ---
+    #
+    # Gemini rejects consecutive contents with the same role, which arises when
+    # a model turn's text and function calls are stored as separate messages
+    # (issue #3290). The adapter collapses such runs into a single Content.
+
+    def _text_message(self, role, *texts):
+        return Content(role=role, parts=[Part(text=t) for t in texts])
+
+    def test_merge_consecutive_user_messages(self):
+        """Two consecutive user messages collapse into one."""
+        result = self.adapter._merge_consecutive_same_role_messages(
+            [self._text_message("user", "a"), self._text_message("user", "b")]
+        )
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].role, "user")
+        self.assertEqual([p.text for p in result[0].parts], ["a", "b"])
+
+    def test_merge_consecutive_model_messages(self):
+        """Two consecutive model messages collapse into one."""
+        result = self.adapter._merge_consecutive_same_role_messages(
+            [
+                self._text_message("user", "q"),
+                self._text_message("model", "x"),
+                self._text_message("model", "y"),
+            ]
+        )
+        self.assertEqual([m.role for m in result], ["user", "model"])
+        self.assertEqual([p.text for p in result[1].parts], ["x", "y"])
+
+    def test_merge_alternating_roles_untouched(self):
+        """Alternating roles pass through unchanged."""
+        messages = [
+            self._text_message("user", "a"),
+            self._text_message("model", "b"),
+            self._text_message("user", "c"),
+        ]
+        self.assertEqual(self.adapter._merge_consecutive_same_role_messages(messages), messages)
+
+    def test_merge_model_text_then_function_call(self):
+        """Model text followed by a model function_call merges (the #3290 shape)."""
+        fc = Content(
+            role="model",
+            parts=[Part(function_call=FunctionCall(name="lookup", args={"q": "x"}))],
+        )
+        result = self.adapter._merge_consecutive_same_role_messages(
+            [self._text_message("user", "hi"), self._text_message("model", "one sec"), fc]
+        )
+        self.assertEqual([m.role for m in result], ["user", "model"])
+        self.assertEqual(result[1].parts[0].text, "one sec")
+        self.assertEqual(result[1].parts[1].function_call.name, "lookup")
+
+    def test_merge_multi_part_messages_preserve_order(self):
+        """Parts are concatenated in message order."""
+        result = self.adapter._merge_consecutive_same_role_messages(
+            [
+                self._text_message("model", "a", "b"),
+                self._text_message("model", "c"),
+                self._text_message("model", "d", "e"),
+            ]
+        )
+        self.assertEqual(len(result), 1)
+        self.assertEqual([p.text for p in result[0].parts], ["a", "b", "c", "d", "e"])
+
+    def test_merge_same_role_empty_and_single(self):
+        """Empty and single-message lists pass through unchanged."""
+        self.assertEqual(self.adapter._merge_consecutive_same_role_messages([]), [])
+        single = [self._text_message("user", "only")]
+        self.assertEqual(self.adapter._merge_consecutive_same_role_messages(single), single)
+
+    def test_merge_same_role_no_input_mutation(self):
+        """Merging does not mutate the input Content objects."""
+        first = self._text_message("user", "a")
+        self.adapter._merge_consecutive_same_role_messages([first, self._text_message("user", "b")])
+        self.assertEqual([p.text for p in first.parts], ["a"])
+
+    def test_consecutive_assistant_messages_collapse_in_context_conversion(self):
+        """End-to-end: separate assistant text and tool-call messages become one model turn."""
+        context = LLMContext(
+            messages=[
+                {"role": "user", "content": "weather?"},
+                {"role": "assistant", "content": "checking"},
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "get_weather", "arguments": '{"city": "Oslo"}'},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": '{"temp": 5}'},
+            ]
+        )
+        params = self.adapter.get_llm_invocation_params(context)
+        messages = params["messages"]
+
+        self.assertEqual([m.role for m in messages], ["user", "model", "user"])
+        model_parts = messages[1].parts
+        self.assertEqual(model_parts[0].text, "checking")
+        self.assertEqual(model_parts[1].function_call.name, "get_weather")
+        response_part = messages[2].parts[0]
+        self.assertIsInstance(response_part.function_response, FunctionResponse)
+        self.assertEqual(response_part.function_response.name, "get_weather")
 
 
 class TestGeminiLiveGetLLMInvocationParams(unittest.TestCase):
