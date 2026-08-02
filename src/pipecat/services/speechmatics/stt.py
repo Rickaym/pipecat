@@ -977,6 +977,40 @@ class SpeechmaticsSTTService(STTService):
                 self.request_finalize()
                 self._client.finalize()
 
+    def _coalesce_segments(self, segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Merge consecutive segments that share speaker, activity and language.
+
+        Within a group, text is joined with spaces, the first segment's
+        timestamp is kept, per-word results are concatenated and `is_eou`
+        is OR-ed. Diarized output keeps one segment per speaker.
+
+        Args:
+            segments: The segments to coalesce.
+
+        Returns:
+            The coalesced segments.
+        """
+        merged: list[dict[str, Any]] = []
+        last_key = None
+        for segment in segments:
+            key = (
+                segment.get("speaker_id"),
+                segment.get("is_active", True),
+                segment.get("language"),
+            )
+            text = (segment.get("text") or "").strip()
+            if merged and key == last_key:
+                previous = merged[-1]
+                previous["text"] = f"{previous['text']} {text}".strip()
+                previous["results"] = previous.get("results", []) + segment.get("results", [])
+                previous["is_eou"] = previous.get("is_eou", False) or segment.get("is_eou", False)
+            else:
+                entry = dict(segment)
+                entry["text"] = text
+                merged.append(entry)
+                last_key = key
+        return merged
+
     async def _send_frames(self, segments: list[dict[str, Any]], finalized: bool = False) -> None:
         """Send frames to the pipeline.
 
@@ -1022,6 +1056,10 @@ class SpeechmaticsSTTService(STTService):
                 and self._finalize_requested
             ):
                 self.confirm_finalize()
+
+            # Multiple finalized frames would make turn-taking close the turn
+            # on the first one and drop the rest of the utterance.
+            segments = self._coalesce_segments(segments)
 
             # Add the finalized frames
             frames += [TranscriptionFrame(**attr_from_segment(segment)) for segment in segments]
